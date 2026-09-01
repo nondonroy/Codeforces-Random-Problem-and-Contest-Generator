@@ -1,0 +1,6 @@
+{
+  "name": "Codeforces Problem & Contest Generator",
+  "description": "Generate randomized, unique Codeforces problem sets and mashup contests for multiple users with filters for unsolved problems, rating ranges, contest age, and hidden spoiler-free tags.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
