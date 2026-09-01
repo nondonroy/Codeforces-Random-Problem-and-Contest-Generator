@@ -8,7 +8,7 @@ Create custom problem sets, filter out solved problems, practice with multiple C
 
 ## 🌐 Live Demo
 
-👉 https://codeforces-random-problem-and-conte.vercel.app/
+👉 https://codeforces-random-problem-and-conte-rho.vercel.app/
 
 ---
 
