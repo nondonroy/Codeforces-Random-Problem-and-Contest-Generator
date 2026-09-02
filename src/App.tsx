@@ -10,8 +10,10 @@ import {
 import {
   fetchAllProblems,
   fetchContestsList,
+  forceRefreshAllProblems,
   generateRandomProblems,
   generateRealContest,
+  getProblemsetStats,
   getSavedUsers,
   loadFullUserProfile,
   saveUsersToStorage,
@@ -76,12 +78,30 @@ export default function App() {
   // Loading & UX States
   const [isLoadingProblems, setIsLoadingProblems] = useState(false);
   const [problemProgressMsg, setProblemProgressMsg] = useState<string>('');
+  const [isSyncingProblemset, setIsSyncingProblemset] = useState(false);
   const [isAddingUser, setIsAddingUser] = useState(false);
   const [refreshingHandle, setRefreshingHandle] = useState<string | null>(null);
   const [rerollingProblemId, setRerollingProblemId] = useState<string | null>(null);
   const [isGenerating, setIsGenerating] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<'contest' | 'contest_gen' | 'problem_gen' | 'checker' | 'users' | 'history'>('contest');
+
+  // Calculate live statistics of the entire official problem archive
+  const problemStats = useMemo(() => getProblemsetStats(allProblems), [allProblems]);
+
+  // Handler to force re-fetch the entire problemset from Codeforces API
+  const handleForceSyncProblemset = async () => {
+    setIsSyncingProblemset(true);
+    setProblemProgressMsg('Re-syncing complete Codeforces Problemset API (11,000+ problems)...');
+    try {
+      const freshProblems = await forceRefreshAllProblems((msg) => setProblemProgressMsg(msg));
+      setAllProblems(freshProblems);
+    } catch (err: any) {
+      setErrorMessage(`Failed to re-sync problemset: ${err.message}`);
+    } finally {
+      setIsSyncingProblemset(false);
+    }
+  };
 
   // 1. Initial Load: Read saved users, filter, and cached history
   useEffect(() => {
@@ -541,6 +561,25 @@ export default function App() {
                 v2.0
               </span>
             </div>
+
+            {/* Official CF API Status Badge */}
+            <div className="hidden md:flex items-center gap-1.5 ml-2 px-2.5 py-1 rounded-lg bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-[11px] font-mono">
+              <span className={`w-2 h-2 rounded-full ${allProblems.length > 0 ? 'bg-emerald-500 animate-pulse' : 'bg-amber-500'}`} />
+              <span className="text-slate-600 dark:text-slate-400">CF API:</span>
+              <strong className="text-slate-900 dark:text-slate-100">
+                {allProblems.length > 0 ? `${allProblems.length.toLocaleString()} Problems` : 'Connecting...'}
+              </strong>
+              <button
+                type="button"
+                id="header-sync-cf-btn"
+                onClick={handleForceSyncProblemset}
+                disabled={isSyncingProblemset || isLoadingProblems}
+                title="Force refresh entire Codeforces Problemset archive"
+                className="p-1 hover:bg-slate-200 dark:hover:bg-slate-800 rounded transition-colors text-slate-400 hover:text-blue-600 cursor-pointer disabled:opacity-50"
+              >
+                <RefreshCw className={`w-3 h-3 ${isSyncingProblemset ? 'animate-spin text-blue-500' : ''}`} />
+              </button>
+            </div>
           </div>
 
           {/* Right Navigation & Theme Switcher - Single Line */}
@@ -731,6 +770,32 @@ export default function App() {
             </button>
           </div>
         )}
+
+        {/* Problemset Transparency & Architecture Indicator */}
+        <div className="p-3.5 rounded-xl bg-gradient-to-r from-blue-50/70 via-indigo-50/40 to-purple-50/60 dark:from-slate-900/90 dark:via-blue-950/30 dark:to-purple-950/20 border border-blue-200/80 dark:border-blue-800/60 shadow-xs flex flex-col md:flex-row md:items-center justify-between gap-3 text-xs">
+          <div className="flex items-center gap-2.5">
+            <div className="p-1.5 rounded-lg bg-blue-600 text-white shrink-0 shadow-xs">
+              <ShieldCheck className="w-4 h-4" />
+            </div>
+            <div>
+              <div className="font-bold text-slate-900 dark:text-white flex items-center gap-2 flex-wrap">
+                <span>Official Codeforces Problemset API</span>
+                <span className="px-1.5 py-0.5 rounded text-[10px] bg-emerald-100 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-300 font-mono font-bold border border-emerald-300 dark:border-emerald-700">
+                  Global Archive Active
+                </span>
+              </div>
+              <p className="text-slate-600 dark:text-slate-300 text-[11px] mt-0.5">
+                Loaded <strong>{allProblems.length.toLocaleString()} problems</strong> across <strong>{problemStats.contestsCount.toLocaleString()} official contests</strong> (rating {problemStats.minRating}–{problemStats.maxRating}). All problems are from the official CF repository; user handles are strictly optional exclusion filters.
+              </p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2 self-start md:self-auto font-mono text-[11px] shrink-0">
+            <span className="text-slate-500 dark:text-slate-400">Exclusion Filter:</span>
+            <span className="px-2 py-0.5 rounded bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-blue-600 dark:text-blue-400 font-bold">
+              {selectedUserHandles.length === 0 ? 'None (All problems available)' : `${selectedUserHandles.length} active user${selectedUserHandles.length > 1 ? 's' : ''}`}
+            </span>
+          </div>
+        </div>
 
         {/* Hero Generator Quick Launcher */}
         <div className="bg-white dark:bg-slate-900/90 border border-slate-200 dark:border-slate-800 rounded-2xl p-5 md:p-6 shadow-sm dark:shadow-xl relative overflow-hidden transition-colors">

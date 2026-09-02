@@ -21,11 +21,86 @@ interface CachedContestData {
 let memoryProblems: CFProblem[] | null = null;
 let memoryContestsMap: Map<number, CFContestInfo> | null = null;
 
+// Lightweight IndexedDB helper for storing the entire 11,000+ problem set reliably
+const IDB_NAME = 'CFProblemsetDB';
+const IDB_VERSION = 1;
+const IDB_STORE = 'cache';
+
+function openIDB(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    if (typeof indexedDB === 'undefined') {
+      return reject(new Error('IndexedDB not supported'));
+    }
+    const request = indexedDB.open(IDB_NAME, IDB_VERSION);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(IDB_STORE)) {
+        db.createObjectStore(IDB_STORE);
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function idbGet<T>(key: string): Promise<T | null> {
+  try {
+    const db = await openIDB();
+    return new Promise((resolve) => {
+      const tx = db.transaction(IDB_STORE, 'readonly');
+      const store = tx.objectStore(IDB_STORE);
+      const req = store.get(key);
+      req.onsuccess = () => resolve((req.result as T) ?? null);
+      req.onerror = () => resolve(null);
+    });
+  } catch {
+    return null;
+  }
+}
+
+async function idbSet(key: string, value: unknown): Promise<void> {
+  try {
+    const db = await openIDB();
+    return new Promise((resolve) => {
+      const tx = db.transaction(IDB_STORE, 'readwrite');
+      const store = tx.objectStore(IDB_STORE);
+      store.put(value, key);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => resolve();
+    });
+  } catch {
+    // Ignore storage failure
+  }
+}
+
+// Fetch helper with fallback to local proxy if direct CF call has CORS or network issues
+async function fetchCFWithFallback(endpoint: string): Promise<Response> {
+  const directUrl = `${BASE_URL}/${endpoint}`;
+  try {
+    const res = await fetch(directUrl);
+    if (res.ok) return res;
+  } catch (err) {
+    console.warn(`Direct fetch to ${directUrl} failed, trying local proxy fallback...`, err);
+  }
+
+  // Fallback to local dev proxy
+  const proxyUrl = `/api/cf/${endpoint}`;
+  try {
+    const proxyRes = await fetch(proxyUrl);
+    if (proxyRes.ok) return proxyRes;
+  } catch (err) {
+    console.warn(`Proxy fetch to ${proxyUrl} also failed:`, err);
+  }
+
+  // Last attempt direct to preserve standard error behavior
+  return fetch(directUrl);
+}
+
 export async function fetchCFUserInfo(handle: string): Promise<Partial<CFUser>> {
   const trimmed = handle.trim();
   if (!trimmed) throw new Error('Handle cannot be empty');
 
-  const res = await fetch(`${BASE_URL}/user.info?handles=${encodeURIComponent(trimmed)}`);
+  const res = await fetchCFWithFallback(`user.info?handles=${encodeURIComponent(trimmed)}`);
   if (!res.ok) {
     if (res.status === 400 || res.status === 404) {
       throw new Error(`User "${trimmed}" not found on Codeforces`);
@@ -54,9 +129,12 @@ export async function fetchCFUserInfo(handle: string): Promise<Partial<CFUser>> 
   };
 }
 
+// NOTE: This function is strictly an optional exclusion filter.
+// It retrieves the solved problem IDs of the user entered by the contestant,
+// so that those problems can be excluded from the generated problemset.
 export async function fetchCFUserSolved(handle: string): Promise<{ solvedIds: string[]; totalSolved: number }> {
   const trimmed = handle.trim();
-  const res = await fetch(`${BASE_URL}/user.status?handle=${encodeURIComponent(trimmed)}&from=1&count=10000`);
+  const res = await fetchCFWithFallback(`user.status?handle=${encodeURIComponent(trimmed)}&from=1&count=10000`);
   if (!res.ok) {
     throw new Error(`Failed to fetch submissions for "${trimmed}"`);
   }
@@ -128,6 +206,22 @@ export async function fetchContestsList(): Promise<Map<number, CFContestInfo>> {
     return memoryContestsMap;
   }
 
+  // 1. Try IndexedDB first
+  try {
+    const idbCached = await idbGet<CachedContestData>(STORAGE_KEY_CONTESTS_CACHE);
+    if (idbCached && Date.now() - idbCached.timestamp < CACHE_TTL_PROBLEMS && idbCached.contests) {
+      const map = new Map<number, CFContestInfo>();
+      for (const [id, contest] of Object.entries(idbCached.contests)) {
+        map.set(Number(id), contest);
+      }
+      memoryContestsMap = map;
+      return map;
+    }
+  } catch (e) {
+    // proceed
+  }
+
+  // 2. Try localStorage fallback
   try {
     const raw = localStorage.getItem(STORAGE_KEY_CONTESTS_CACHE);
     if (raw) {
@@ -145,8 +239,9 @@ export async function fetchContestsList(): Promise<Map<number, CFContestInfo>> {
     console.warn('Error reading contest cache:', e);
   }
 
+  // 3. Fetch from API
   try {
-    const res = await fetch(`${BASE_URL}/contest.list?gym=false`);
+    const res = await fetchCFWithFallback('contest.list?gym=false');
     if (!res.ok) throw new Error('Contest list request failed');
     const data = await res.json();
     if (data.status === 'OK' && Array.isArray(data.result)) {
@@ -157,6 +252,7 @@ export async function fetchContestsList(): Promise<Map<number, CFContestInfo>> {
         record[c.id] = c;
       }
       memoryContestsMap = map;
+      await idbSet(STORAGE_KEY_CONTESTS_CACHE, { timestamp: Date.now(), contests: record });
       try {
         localStorage.setItem(
           STORAGE_KEY_CONTESTS_CACHE,
@@ -174,26 +270,56 @@ export async function fetchContestsList(): Promise<Map<number, CFContestInfo>> {
   return memoryContestsMap || new Map<number, CFContestInfo>();
 }
 
-export async function fetchAllProblems(onProgress?: (msg: string) => void): Promise<CFProblem[]> {
-  if (memoryProblems && memoryProblems.length > 0) {
+// PRIMARY PROBLEM REPOSITORY LOADER:
+// Fetches the entire official Codeforces problem archive (11,000+ problems across all rounds,
+// div 1/2/3/4, educational, and global rounds) directly from the official Codeforces
+// Problemset API endpoint (https://codeforces.com/api/problemset.problems).
+export async function fetchAllProblems(
+  onProgress?: (msg: string) => void,
+  bypassCache = false
+): Promise<CFProblem[]> {
+  if (!bypassCache && memoryProblems && memoryProblems.length > 0) {
     return memoryProblems;
   }
 
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY_PROBLEMSET_CACHE);
-    if (raw) {
-      const cached: CachedProblemData = JSON.parse(raw);
-      if (Date.now() - cached.timestamp < CACHE_TTL_PROBLEMS && Array.isArray(cached.problems) && cached.problems.length > 500) {
-        memoryProblems = cached.problems;
-        return cached.problems;
+  if (!bypassCache) {
+    // 1. Try IndexedDB cache first (no quota limits)
+    try {
+      const idbCached = await idbGet<CachedProblemData>(STORAGE_KEY_PROBLEMSET_CACHE);
+      if (
+        idbCached &&
+        Date.now() - idbCached.timestamp < CACHE_TTL_PROBLEMS &&
+        Array.isArray(idbCached.problems) &&
+        idbCached.problems.length > 500
+      ) {
+        memoryProblems = idbCached.problems;
+        return idbCached.problems;
       }
+    } catch (e) {
+      // proceed
     }
-  } catch (e) {
-    console.warn('Error reading problem cache:', e);
+
+    // 2. Try localStorage cache fallback
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY_PROBLEMSET_CACHE);
+      if (raw) {
+        const cached: CachedProblemData = JSON.parse(raw);
+        if (
+          Date.now() - cached.timestamp < CACHE_TTL_PROBLEMS &&
+          Array.isArray(cached.problems) &&
+          cached.problems.length > 500
+        ) {
+          memoryProblems = cached.problems;
+          return cached.problems;
+        }
+      }
+    } catch (e) {
+      console.warn('Error reading problem cache:', e);
+    }
   }
 
-  onProgress?.('Fetching official Codeforces problem repository (~9,000+ problems)...');
-  const res = await fetch(`${BASE_URL}/problemset.problems`);
+  onProgress?.('Fetching official Codeforces Problemset API (11,000+ problems archive)...');
+  const res = await fetchCFWithFallback('problemset.problems');
   if (!res.ok) {
     throw new Error(`Failed to load Codeforces problemset (${res.status} ${res.statusText})`);
   }
@@ -228,16 +354,51 @@ export async function fetchAllProblems(onProgress?: (msg: string) => void): Prom
 
   memoryProblems = problems;
 
+  // Persist to IndexedDB (safe for multi-megabyte datasets)
+  await idbSet(STORAGE_KEY_PROBLEMSET_CACHE, { timestamp: Date.now(), problems });
+
   try {
     localStorage.setItem(
       STORAGE_KEY_PROBLEMSET_CACHE,
       JSON.stringify({ timestamp: Date.now(), problems } as CachedProblemData)
     );
   } catch (e) {
-    console.warn('Failed to cache problems to localStorage (likely size limit, held in memory)');
+    // Quota exceeded on localStorage is expected for 11,000 problems, IndexedDB handles it safely
   }
 
   return problems;
+}
+
+// Force-refreshes problemset bypassing cache
+export async function forceRefreshAllProblems(onProgress?: (msg: string) => void): Promise<CFProblem[]> {
+  memoryProblems = null;
+  return fetchAllProblems(onProgress, true);
+}
+
+// Calculate summary stats of the whole loaded problemset
+export function getProblemsetStats(problems: CFProblem[]) {
+  const total = problems.length;
+  const rated = problems.filter((p) => typeof p.rating === 'number').length;
+  let minRating = 3500;
+  let maxRating = 800;
+  const contestIds = new Set<number>();
+
+  for (const p of problems) {
+    if (p.contestId) contestIds.add(p.contestId);
+    if (typeof p.rating === 'number') {
+      if (p.rating < minRating) minRating = p.rating;
+      if (p.rating > maxRating) maxRating = p.rating;
+    }
+  }
+
+  return {
+    total,
+    rated,
+    unrated: total - rated,
+    minRating: minRating === 3500 ? 800 : minRating,
+    maxRating: maxRating === 800 ? 3500 : maxRating,
+    contestsCount: contestIds.size,
+  };
 }
 
 // Shuffles array randomly (Fisher-Yates)
